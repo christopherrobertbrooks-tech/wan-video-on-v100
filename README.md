@@ -103,3 +103,11 @@ FastWan 2.2 TI2V-5B FullAttn by FastVideo (Apache-2.0). See [CREDITS.md](CREDITS
 Anthropic). A person directed the work and chose what to test.
 
 Code: MIT (see [LICENSE](LICENSE)). The clips are outputs of the models above.
+
+**Optional: the text encoder in fp16.** `--te-fp16-plan PLAN.json` runs umT5 in fp16 with an
+[fp16-fixer](https://github.com/christopherrobertbrooks-tech/fp16-fixer) plan
+([plans/wan22-umt5-xxl](https://github.com/christopherrobertbrooks-tech/fp16-fixer/tree/main/plans/wan22-umt5-xxl)):
+plain fp16 clips the encoder's values (61% median error on held-out prompts); with the plan it is 0.2% from fp32, and
+the encoder stage peaks at 12.7 GB instead of 21.5 GB. The same 3-step draft clip comes out at 33.5 dB PSNR against
+the fp32 encoder (two fp32 runs are identical). If fp16-fixer (`--fp16fix`, default `/mnt/steam/fp16-fixer`) or the
+plan is missing, or a prompt still comes out non-finite, it uses fp32.

@@ -2,8 +2,10 @@
 
 The V100 has no fast bf16 and no FlashAttention, and the machine this was written on has only 16 GB of system RAM, so:
 - the video model (transformer) runs in fp16, loaded straight onto the GPU;
-- the umT5 text encoder runs in fp32 (umT5/T5 can overflow in fp16), encodes the prompt and the negative prompt, and is
-  deleted before the video model loads (the prompt is embedded the way diffusers' WanPipeline does it: padded to 512,
+- the umT5 text encoder runs in fp32 (umT5/T5 can overflow in fp16) -- or, with --te-fp16-plan, in fp16 with an
+  fp16-fixer plan (https://github.com/christopherrobertbrooks-tech/fp16-fixer, plans/wan22-umt5-xxl: same output
+  within ~0.2%, half the memory, ~3x faster; a prompt that still comes out non-finite is redone in fp32) -- encodes the
+  prompt and the negative prompt, and is deleted before the video model loads (the prompt is embedded the way diffusers' WanPipeline does it: padded to 512,
   zeros after the real tokens -- done by hand so the optional `ftfy` package isn't needed);
 - the VAE decodes in fp16 with --vae-fp16 (about 4x faster than fp32 here, no visible change), tiled with --tile;
 - frames are piped to ffmpeg (no imageio/opencv needed).
@@ -17,7 +19,9 @@ Run with CUDA_VISIBLE_DEVICES set to the V100. Tested: diffusers 0.41.0, transfo
 """
 import argparse
 import gc
+import os
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -73,25 +77,54 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tile", action="store_true", help="decode in tiles (needed at 720p x 121 frames)")
     ap.add_argument("--vae-fp16", action="store_true", help="decode in fp16 (V100 tensor cores; ~4x faster than fp32)")
+    ap.add_argument("--te-fp16-plan", help="run the umT5 text encoder in fp16 with this fp16-fixer plan.json")
+    ap.add_argument("--fp16fix", default=os.environ.get("FP16FIX", "/mnt/steam/fp16-fixer"),
+                    help="where the fp16-fixer repo is (for --te-fp16-plan)")
     a = ap.parse_args()
     W, H = a.width, a.height
     t0 = time.time()
 
     tok = AutoTokenizer.from_pretrained(a.model, subfolder="tokenizer")
-    te = UMT5EncoderModel.from_pretrained(a.model, subfolder="text_encoder", dtype=torch.float32, device_map={"": 0},
-                                          low_cpu_mem_usage=True).eval()
+    fixes = None
+    if a.te_fp16_plan:
+        try:
+            sys.path.insert(0, a.fp16fix)
+            from fp16fix.apply import Applied
+            from fp16fix.plan import load_fixes
+            fixes = load_fixes(a.te_fp16_plan)
+        except Exception as e:                     # no fp16-fixer or no plan: the fp32 encoder, as before
+            print(f"[text encoder] fp16 plan unavailable ({type(e).__name__}: {e}); using fp32", flush=True)
+
+    def load_te(dtype):
+        return UMT5EncoderModel.from_pretrained(a.model, subfolder="text_encoder", dtype=dtype, device_map={"": 0},
+                                                low_cpu_mem_usage=True).eval()
+
+    te = load_te(torch.float16 if fixes else torch.float32)
 
     def embed(text):
+        nonlocal te
         t = tok([text], padding="max_length", max_length=512, truncation=True, add_special_tokens=True,
                 return_attention_mask=True, return_tensors="pt")
         n = int(t.attention_mask.sum())
         with torch.no_grad():
-            e = te(t.input_ids.cuda(), t.attention_mask.cuda()).last_hidden_state[0, :n]
+            if te.dtype == torch.float16:
+                with Applied(te, fixes):
+                    e = te(t.input_ids.cuda(), t.attention_mask.cuda()).last_hidden_state[0, :n].float()
+                if not torch.isfinite(e).all():    # outside what the plan was calibrated on: redo in fp32
+                    print("[text encoder] fp16 + plan gave inf/nan for a prompt; switching to fp32", flush=True)
+                    del te
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    te = load_te(torch.float32)
+            if te.dtype == torch.float32:
+                e = te(t.input_ids.cuda(), t.attention_mask.cuda()).last_hidden_state[0, :n]
         e = torch.cat([e, e.new_zeros(512 - n, e.size(1))])[None]
         assert torch.isfinite(e).all(), "the text encoder gave inf/nan"
         return e.to(torch.float16)
 
     pe, ne = embed(a.prompt), embed(NEGATIVE)
+    print(f"[text encoder] {'fp16 + fp16-fixer plan' if te.dtype == torch.float16 else 'fp32'}: {time.time() - t0:.1f} s, "
+          f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
     del te
     gc.collect()
     torch.cuda.empty_cache()
